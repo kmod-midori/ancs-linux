@@ -1,12 +1,16 @@
-use std::io::Cursor;
+use std::{collections::HashMap, io::Cursor};
 
 use ancs::{
     attributes::{
+        app::AppAttributeID,
         command::CommandID,
         event::{EventFlag, EventID},
-        notification::NotificationAttributeID,
+        notification::NotificationAttributeID, AppAttribute,
     },
-    characteristics::{control_point::GetNotificationAttributesRequest, data_source},
+    characteristics::{
+        control_point::{GetAppAttributesRequest, GetNotificationAttributesRequest},
+        data_source,
+    },
 };
 use anyhow::{bail, Result};
 use bluer::{
@@ -19,12 +23,14 @@ use futures::{pin_mut, StreamExt as _};
 
 struct AncsProcessor {
     control_point: Option<Characteristic>,
+    app_names: HashMap<String, String>,
 }
 
 impl AncsProcessor {
     pub fn new() -> Self {
         Self {
             control_point: None,
+            app_names: HashMap::new(),
         }
     }
 
@@ -148,23 +154,13 @@ impl AncsProcessor {
             notification_uid,
             attribute_ids: vec![
                 (NotificationAttributeID::AppIdentifier, None),
-                (NotificationAttributeID::Title, Some(100)),
-                (NotificationAttributeID::Subtitle, Some(100)),
-                (NotificationAttributeID::Message, Some(100)),
+                (NotificationAttributeID::Title, Some(64)),
+                (NotificationAttributeID::Subtitle, Some(64)),
+                (NotificationAttributeID::Message, Some(64)),
             ],
         };
 
-        self.control_point
-            .as_ref()
-            .unwrap()
-            .write_ext(
-                &Vec::from(cmd),
-                &CharacteristicWriteRequest {
-                    op_type: bluer::gatt::WriteOp::Request,
-                    ..Default::default()
-                },
-            )
-            .await?;
+        self.write_control_point(&Vec::from(cmd)).await?;
 
         Ok(())
     }
@@ -180,12 +176,20 @@ impl AncsProcessor {
                 };
                 log::info!("Notif: {:?}", notif);
 
+                let mut app_id_to_query = None;
+
                 let mut desktop_notification = notify_rust::Notification::new();
                 for attr in notif.attribute_list {
                     match attr.id {
                         NotificationAttributeID::AppIdentifier => {
-                            if let Some(v) = attr.value {
-                                desktop_notification.appname(&v);
+                            if let Some(id) = attr.value {
+                                if let Some(name) = self.app_names.get(&id) {
+                                    desktop_notification.appname(name);
+                                } else {
+                                    // Query for app name
+                                    desktop_notification.appname(&id);
+                                    app_id_to_query = Some(id);
+                                }
                             }
                         }
                         NotificationAttributeID::Title => {
@@ -201,23 +205,70 @@ impl AncsProcessor {
                         _ => {}
                     }
                 }
+
                 let handle = desktop_notification.show_async().await?;
                 log::info!(
                     "Shown notification {} with desktop handle {}",
                     notif.notification_uid,
                     handle.id()
                 );
+
+                if let Some(app_id) = app_id_to_query {
+                    log::info!("Querying app name for {}", app_id);
+                    let cmd = GetAppAttributesRequest {
+                        command_id: CommandID::GetAppAttributes,
+                        app_identifier: app_id,
+                        attribute_ids: vec![AppAttributeID::DisplayName],
+                    };
+                    self.write_control_point(&Vec::from(cmd)).await?;
+                }
             }
             1 => {
-                let app = match data_source::GetAppAttributesResponse::parse(&data) {
-                    Ok((_, app)) => app,
+                let mut app_id = vec![];
+                let mut offset = 1;
+                for i in offset..data.len() {
+                    offset += 1;
+                    if data[i] == 0 {
+                        break;
+                    }
+                    app_id.push(data[i]);
+                }
+                let app_id = String::from_utf8_lossy(&app_id); // NULL-terminated string
+
+                let attribute = match AppAttribute::parse(&data[offset..]) {
+                    Ok((_, attribute)) => attribute,
                     Err(e) => {
                         bail!("Error parsing app attributes: {:?}", e);
                     }
                 };
-                log::info!("App: {:?}", app);
+
+                if attribute.id == AppAttributeID::DisplayName {
+                    if let Some(name) = attribute.value {
+                        log::info!("{} => {}", app_id, name);
+                        // Store app name
+                        self.app_names.insert(app_id.to_string(), name);
+                    }
+                } else {
+                    log::info!("Unknown app attribute: {:?}", attribute);
+                }
             }
             _ => {}
+        }
+
+        Ok(())
+    }
+
+    async fn write_control_point(&self, data: &[u8]) -> Result<()> {
+        if let Some(control_point) = &self.control_point {
+            control_point
+                .write_ext(
+                    data,
+                    &CharacteristicWriteRequest {
+                        op_type: bluer::gatt::WriteOp::Request,
+                        ..Default::default()
+                    },
+                )
+                .await?;
         }
 
         Ok(())
