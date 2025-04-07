@@ -32,7 +32,7 @@ impl AncsProcessor {
         let device = adapter.device(device_addr)?;
 
         if !device.is_connected().await? {
-            log::info!("Device {} is not connected", device_addr);
+            log::debug!("Device {} is not connected", device_addr);
             return Ok(());
         }
 
@@ -238,10 +238,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-    env_logger::init();
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .init();
 
     let args = Args::parse();
 
@@ -261,7 +261,6 @@ async fn main() -> Result<()> {
             log::error!("Error: {:?}", e);
         }
 
-        log::info!("Restarting in 10 seconds");
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
 }
